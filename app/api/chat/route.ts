@@ -1,42 +1,43 @@
-import { type NextRequest, NextResponse } from "next/server";
-import { type Message as VercelChatMessage, StreamingTextResponse } from "ai";
-import { PromptTemplate } from "@langchain/core/prompts";
-import { ChatOpenAI } from "@langchain/openai";
-import { BytesOutputParser } from "@langchain/core/output_parsers";
-import { auth } from "@clerk/nextjs/server";
-import { currentUser } from "@clerk/nextjs/server";
-import { v4 as uuidv4 } from "uuid";
-import { Mistral } from "@mistralai/mistralai";
-import { eq } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { chats, messages } from "@/lib/db/schema";
-import { messageQueue } from "@/lib/queue";
-import { addDocumentToVectorStore, queryVectorStore } from "@/lib/rag";
-import IORedis from "ioredis";
+import { type NextRequest, NextResponse } from "next/server"
+import { type Message as VercelChatMessage, StreamingTextResponse } from "ai"
+import { PromptTemplate } from "@langchain/core/prompts"
+import { ChatOpenAI } from "@langchain/openai"
+import { BytesOutputParser } from "@langchain/core/output_parsers"
+import { auth } from "@clerk/nextjs/server"
+import { currentUser } from "@clerk/nextjs/server"
+import { v4 as uuidv4 } from "uuid"
+import { Mistral } from "@mistralai/mistralai"
+import { eq } from "drizzle-orm"
+import { db } from "@/lib/db"
+import { chats, messages } from "@/lib/db/schema"
+import { messageQueue } from "@/lib/queue"
+import { addDocumentToVectorStore, queryVectorStore } from "@/lib/rag"
+import { getMemories, storeMemory, extractMemories } from "@/lib/memory"
+import IORedis from "ioredis"
 
-const redis = new IORedis(process.env.REDIS_URL || "redis://localhost:6379");
+const redis = new IORedis(process.env.REDIS_URL || "redis://localhost:6379")
 
-// Properly defined interfaces to match Mistral API expectations
+
 interface ImageURLChunk {
-  type: "image_url";
-  imageUrl: string;
+  type: "image_url"
+  imageUrl: string
 }
 
 interface DocumentURLChunk {
-  type: "document_url";
-  documentUrl: string;
+  type: "document_url"
+  documentUrl: string
 }
 
 interface TextChunk {
-  type: "text";
-  text: string;
+  type: "text"
+  text: string
 }
 
-type ContentChunk = TextChunk | ImageURLChunk | DocumentURLChunk;
+type ContentChunk = TextChunk | ImageURLChunk | DocumentURLChunk
 
 const formatMessage = (message: VercelChatMessage): string => {
-  return `${message.role}: ${message.content}`;
-};
+  return `${message.role}: ${message.content}`
+}
 
 const TEMPLATE = `You are Vidharini, a highly knowledgeable, experienced, and professional legal chatbot specialized in Indian law.
 Your mission is to provide clear, actionable, and reliable legal advice and guidance to users, helping them understand their rights, options, and next steps in complex legal situations.
@@ -57,71 +58,71 @@ Special Focus Areas:
 - Dispute Resolution Options: Outline the steps for amicable resolution, negotiation, mediation, or filing cases in civil courts, as well as escalation pathways when disputes cannot be resolved through dialogue.
 If the user has uploaded documents, analyze them carefully and provide insights based on their content. For PDFs and images, extract relevant legal information and provide analysis.
 Remember to keep track of the conversation history, so you can maintain a sense of continuity and truly engage with each user's unique journey.
+
+User Memory Information:
+{memory_info}
+
 Current conversation:
 {chat_history}
 User: {input}
-AI:`;
+AI:`
 
 export async function POST(req: NextRequest) {
-  const authResult = await auth(); // Await the auth result
-  const { userId } = authResult;
+  const authResult = await auth() // Await the auth result
+  const { userId } = authResult
 
   if (!userId) {
-    return new NextResponse("Unauthorized", { status: 401 });
+    return new NextResponse("Unauthorized", { status: 401 })
   }
 
-  const userResult = await currentUser(); // Await the currentUser result
-  const user = userResult;
+  const userResult = await currentUser() // Await the currentUser result
+  const user = userResult
 
   if (!user) {
-    return new NextResponse("User not found", { status: 404 });
+    return new NextResponse("User not found", { status: 404 })
   }
 
   if (!process.env.OPENAI_API_KEY) {
-    return new NextResponse("OpenAI API key not configured", { status: 500 });
+    return new NextResponse("OpenAI API key not configured", { status: 500 })
   }
 
-  const taskId = uuidv4();
-  await redis.set(
-    `task:${taskId}`,
-    JSON.stringify({ status: "processing", result: null }),
-    "EX",
-    3600
-  );
+  const taskId = uuidv4()
+  await redis.set(`task:${taskId}`, JSON.stringify({ status: "processing", result: null }), "EX", 3600)
 
   try {
-    const body = await req.json();
-    const { messages: chatMessages, chatId, isTemporary, files } = body;
+    const body = await req.json()
+    const { messages: chatMessages, chatId, isTemporary, files } = body
 
     if (!chatMessages || !Array.isArray(chatMessages) || chatMessages.length === 0) {
-      return new NextResponse("Invalid messages format", { status: 400 });
+      return new NextResponse("Invalid messages format", { status: 400 })
     }
 
-    let fileContent = "";
+
+    let fileContent = ""
     if (files && files.length > 0 && process.env.MISTRAL_API_KEY) {
       try {
-        const mistralClient = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
+        const mistralClient = new Mistral({ apiKey: process.env.MISTRAL_API_KEY })
         for (const file of files) {
           if (file.type === "application/pdf" || file.type.startsWith("image/")) {
-            // Create the content array with proper typing
+
             const contentArray: ContentChunk[] = [
               {
                 type: "text",
-                text: "Extract all text from the document."
-              }
-            ];
+                text: "Extract all text from the document.",
+              },
+            ]
 
-            // Add the appropriate content type based on file type
+
             if (file.type.startsWith("image/")) {
               contentArray.push({
                 type: "image_url",
-                imageUrl: file.url
-              });
+                imageUrl: file.url,
+              })
             } else {
               contentArray.push({
                 type: "document_url",
-                documentUrl: file.url
-              });
+                documentUrl: file.url,
+              })
             }
 
             const chatResponse = await mistralClient.chat.complete({
@@ -129,50 +130,49 @@ export async function POST(req: NextRequest) {
               messages: [
                 {
                   role: "user",
-                  content: contentArray
-                }
-              ]
-            });
+                  content: contentArray,
+                },
+              ],
+            })
 
-            // Handle potential undefined response
+
             if (!chatResponse.choices || chatResponse.choices.length === 0) {
-              console.error("No choices returned in chat response");
-              continue;
+              console.error("No choices returned in chat response")
+              continue
             }
 
-            const extractedText = chatResponse.choices[0]?.message?.content;
+            const extractedText = chatResponse.choices[0]?.message?.content
             if (!extractedText) {
-              console.error("No text extracted from chat response:", chatResponse);
-              continue;
+              console.error("No text extracted from chat response:", chatResponse)
+              continue
             }
 
-            // Ensure extracted text is treated as string
-            const textContent = typeof extractedText === 'string' 
-              ? extractedText 
-              : JSON.stringify(extractedText);
 
-            console.log(`Extracted text from file "${file.name}":`, textContent);
+            const textContent = typeof extractedText === "string" ? extractedText : JSON.stringify(extractedText)
 
-            fileContent += `\n\nContent from file "${file.name}":\n${textContent}\n\n`;
+            console.log(`Extracted text from file "${file.name}":`, textContent)
+
+            fileContent += `\n\nContent from file "${file.name}":\n${textContent}\n\n`
 
             await addDocumentToVectorStore(textContent, {
               fileId: file.fileId || file.name,
               fileName: file.name,
-            });
+            })
           }
         }
       } catch (error) {
-        console.error("Error processing files with Mistral:", error);
+        console.error("Error processing files with Mistral:", error)
       }
     }
 
-    let chatIdToUse = chatId;
+
+    let chatIdToUse = chatId
     if (!isTemporary) {
       try {
         if (!chatId) {
-          const newChatId = uuidv4();
-          const firstMessage = chatMessages[0].content;
-          const chatTitle = firstMessage.length > 50 ? `${firstMessage.substring(0, 50)}...` : firstMessage;
+          const newChatId = uuidv4()
+          const firstMessage = chatMessages[0].content
+          const chatTitle = firstMessage.length > 50 ? `${firstMessage.substring(0, 50)}...` : firstMessage
 
           await db.insert(chats).values({
             id: newChatId,
@@ -180,51 +180,79 @@ export async function POST(req: NextRequest) {
             title: chatTitle,
             createdAt: new Date(),
             updatedAt: new Date(),
-          });
+          })
 
-          chatIdToUse = newChatId;
+          chatIdToUse = newChatId
         } else {
-          const existingChat = await db.select().from(chats).where(eq(chats.id, chatId)).limit(1);
+          const existingChat = await db.select().from(chats).where(eq(chats.id, chatId)).limit(1)
           if (existingChat.length === 0) {
-            return new NextResponse("Chat not found", { status: 404 });
+            return new NextResponse("Chat not found", { status: 404 })
           }
-          await db.update(chats).set({ updatedAt: new Date() }).where(eq(chats.id, chatId));
+          await db.update(chats).set({ updatedAt: new Date() }).where(eq(chats.id, chatId))
         }
       } catch (dbError) {
-        console.error("Database error with chat:", dbError);
-        return new NextResponse(
-          JSON.stringify({ error: "Database error processing chat" }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
-        );
+        console.error("Database error with chat:", dbError)
+        return new NextResponse(JSON.stringify({ error: "Database error processing chat" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        })
       }
     }
 
-    const currentMessageContent = chatMessages[chatMessages.length - 1].content;
-    const formattedPreviousMessages = chatMessages.slice(0, -1).map(formatMessage);
-    const userInput = fileContent ? `${currentMessageContent}\n\n${fileContent}` : currentMessageContent;
+    // Extract potential memories from user message
+    const currentMessageContent = chatMessages[chatMessages.length - 1].content
+    const extractedMemories = await extractMemories(currentMessageContent)
 
-    const relevantDocs = await queryVectorStore(userInput, 3);
-    const context = relevantDocs.map((doc) => doc.pageContent).join("\n");
-    const augmentedInput = context ? `${userInput}\n\nRelevant Document Context:\n${context}` : userInput;
+    // Store any extracted memories
+    for (const [key, value] of Object.entries(extractedMemories)) {
+      await storeMemory(userId, key, value, "extracted", 0.8)
+    }
 
-    const prompt = PromptTemplate.fromTemplate(TEMPLATE);
+    // Get existing memories for context
+    const userMemories = await getMemories(userId)
+    let memoryContext = "No specific user information available."
+
+    if (Object.keys(userMemories).length > 0) {
+      memoryContext = "User Information:\n"
+      for (const [key, items] of Object.entries(userMemories)) {
+        // Sort by confidence and take the highest
+        const sortedItems = [...items].sort((a, b) => b.confidence - a.confidence)
+        if (sortedItems.length > 0) {
+          memoryContext += `- ${key}: ${sortedItems[0].value}\n`
+        }
+      }
+    }
+
+    // Prepare for AI response
+    const formattedPreviousMessages = chatMessages.slice(0, -1).map(formatMessage)
+    const userInput = fileContent ? `${currentMessageContent}\n\n${fileContent}` : currentMessageContent
+
+    // Get relevant documents from vector store
+    const relevantDocs = await queryVectorStore(userInput, 3)
+    const context = relevantDocs.map((doc) => doc.pageContent).join("\n")
+    const augmentedInput = context ? `${userInput}\n\nRelevant Document Context:\n${context}` : userInput
+
+    // Generate AI response
+    const prompt = PromptTemplate.fromTemplate(TEMPLATE)
     const model = new ChatOpenAI({
       temperature: 0.7,
       modelName: "gpt-4o-mini",
       streaming: true,
       openAIApiKey: process.env.OPENAI_API_KEY,
-    });
+    })
 
-    const outputParser = new BytesOutputParser();
-    const chain = prompt.pipe(model).pipe(outputParser);
+    const outputParser = new BytesOutputParser()
+    const chain = prompt.pipe(model).pipe(outputParser)
     const stream = await chain.stream({
       chat_history: formattedPreviousMessages.join("\n"),
       input: augmentedInput,
-    });
+      memory_info: memoryContext,
+    })
 
+    // Store user message in database if not temporary
     if (!isTemporary && chatIdToUse) {
       try {
-        const userMessage = chatMessages[chatMessages.length - 1];
+        const userMessage = chatMessages[chatMessages.length - 1]
         await db.insert(messages).values({
           id: uuidv4(),
           chatId: chatIdToUse,
@@ -232,53 +260,44 @@ export async function POST(req: NextRequest) {
           content: userMessage.content,
           files: files ? JSON.stringify(files) : null,
           createdAt: new Date(),
-        });
+        })
       } catch (dbError) {
-        console.error("Database error with message:", dbError);
+        console.error("Database error with message:", dbError)
       }
     }
 
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let assistantMessage = "";
+    // Process the stream
+    const reader = stream.getReader()
+    const decoder = new TextDecoder()
+    let assistantMessage = ""
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read()
       if (done) {
         if (!isTemporary && chatIdToUse) {
           await messageQueue.add("store-message", {
             chatId: chatIdToUse,
             content: assistantMessage,
             role: "assistant",
-          });
+          })
         }
-        await redis.set(
-          `task:${taskId}`,
-          JSON.stringify({ status: "completed", result: assistantMessage }),
-          "EX",
-          3600
-        );
-        break;
+        await redis.set(`task:${taskId}`, JSON.stringify({ status: "completed", result: assistantMessage }), "EX", 3600)
+        break
       }
 
-      const chunk = decoder.decode(value);
-      assistantMessage += chunk;
+      const chunk = decoder.decode(value)
+      assistantMessage += chunk
     }
 
-    return new StreamingTextResponse(stream, { headers: { "X-Task-ID": taskId } });
+    return new StreamingTextResponse(stream, { headers: { "X-Task-ID": taskId } })
   } catch (error) {
-    console.error("Error in chat API:", error);
-    await redis.set(
-      `task:${taskId}`,
-      JSON.stringify({ status: "failed", result: null }),
-      "EX",
-      3600
-    );
+    console.error("Error in chat API:", error)
+    await redis.set(`task:${taskId}`, JSON.stringify({ status: "failed", result: null }), "EX", 3600)
     return new NextResponse(
       JSON.stringify({
         error: error instanceof Error ? error.message : "Failed to process chat message",
       }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    )
   }
 }
